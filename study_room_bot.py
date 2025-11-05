@@ -11,21 +11,19 @@ import os
 
 # --- Configuration ---
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID"))  # Your server ID for guild-based commands
+GUILD_ID = 123456789012345678  # Replace with your server ID for testing
 
-if not BOT_TOKEN or not GUILD_ID:
-    print("FATAL ERROR: DISCORD_BOT_TOKEN or GUILD_ID environment variable not set. The bot cannot start.")
+if not BOT_TOKEN:
+    print("FATAL ERROR: DISCORD_BOT_TOKEN environment variable not set. The bot cannot start.")
     exit()
 
 DB_NAME = "study_data.db"
 
-# Intents
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 intents.voice_states = True
 
-# --- Bot Class ---
 class StudyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix='!', intents=intents)
@@ -57,15 +55,15 @@ class StudyBot(commands.Bot):
 
     async def on_ready(self):
         print(f'Logged in as {self.user} (ID: {self.user.id})')
-        
         guild = discord.Object(id=GUILD_ID)
-        self.tree.copy_global_to(guild=guild)  # Copy commands to guild
-        await self.tree.sync(guild=guild)      # Sync slash commands only for this guild
-        
-        print("Guild-based slash commands synced.")
+        await self.tree.sync(guild=guild)
+        print(f"Slash commands synced for guild {GUILD_ID}")
+        # Uncomment the next lines when ready for global sync
+        # await self.tree.sync()
+        # print("Slash commands synced globally")
 
-    # --------------------- Core Methods ---------------------
-    async def _log_session(self, owner_id: int, partner_id: int, start_time: datetime, duration_seconds: int, topic: str):
+    # --- Session logging & cleanup functions ---
+    async def _log_session(self, owner_id, partner_id, start_time, duration_seconds, topic):
         end_time = start_time + timedelta(seconds=duration_seconds)
         self.db_cursor.execute('''
             INSERT INTO sessions (user_id, partner_id, start_time, end_time, duration_seconds, topic)
@@ -73,49 +71,43 @@ class StudyBot(commands.Bot):
         ''', (owner_id, partner_id, start_time.isoformat(), end_time.isoformat(), duration_seconds, topic))
         self.db_conn.commit()
 
-    async def _perform_cleanup(self, channel_id: int, reason: str, duration_seconds: int = 0, topic: str = "N/A"):
+    async def _perform_cleanup(self, channel_id, reason, duration_seconds=0, topic="N/A"):
         room_data = self.active_rooms.pop(channel_id, None)
         if not room_data:
             return
-
         owner_id = room_data['owner_id']
         partner_id = room_data['partner_id']
         start_time = room_data['start_time']
         if duration_seconds == 0:
             duration_seconds = int((datetime.now() - start_time).total_seconds())
-
         await self._log_session(owner_id, partner_id, start_time, duration_seconds, topic)
         self.owner_to_channel.pop(owner_id, None)
-
+        guild = self.get_channel(channel_id).guild
+        if not guild: return
         channel = self.get_channel(channel_id)
-        if not channel:
-            return
-        guild = channel.guild
         role = guild.get_role(room_data['role_id'])
-
         if 'timer_task' in room_data:
             room_data['timer_task'].cancel()
-
         if role:
             try: await role.delete(reason=f"Cleanup: {reason}")
             except: pass
         if channel:
             try: await channel.delete(reason=f"Cleanup: {reason}")
             except: pass
-
         print(f"Cleanup complete for channel {channel_id}. Reason: {reason} (Duration: {duration_seconds}s)")
 
-    async def cleanup_room_timer(self, channel_id: int, duration_minutes: int, topic: str):
+    async def cleanup_room_timer(self, channel_id, duration_minutes, topic):
         try:
             await asyncio.sleep(duration_minutes * 60)
             await self._perform_cleanup(channel_id, f"Timed session expired ({duration_minutes} minutes).",
                                         duration_seconds=duration_minutes * 60, topic=topic)
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            print(f"Error in cleanup timer: {e}")
 
-    # --------------------- Events ---------------------
     @commands.Cog.listener()
-    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    async def on_voice_state_update(self, member, before, after):
         if before.channel and before.channel.id in self.active_rooms and after.channel != before.channel:
             human_members = [m for m in before.channel.members if not m.bot]
             if not human_members:
@@ -124,74 +116,60 @@ class StudyBot(commands.Bot):
                                             f"Study room auto-deleted because it became empty after {member.name} left.",
                                             topic=room_data.get('topic', 'N/A'))
 
-    # --------------------- Slash Commands ---------------------
+    # --- Slash Commands ---
     @app_commands.command(name="bookroom", description="Book a private study room with a partner for a specified duration.")
-    @app_commands.describe(
-        topic="A short name for the study session (e.g., 'Calculus-Review')",
-        partner="The study partner to invite (mention their @username)",
-        duration_minutes="The length of the session in minutes (1 to 360 max)"
-    )
+    @app_commands.describe(topic="A short name for the session", partner="Partner to invite", duration_minutes="Length in minutes (1-360)")
     async def bookroom(self, interaction: discord.Interaction, topic: str, partner: discord.Member, duration_minutes: app_commands.Range[int, 1, 360]):
         await interaction.response.defer(thinking=True)
         if interaction.user.id in self.owner_to_channel:
-            await interaction.followup.send(f"You already have an active study room: <#{self.owner_to_channel[interaction.user.id]}>.")
+            await interaction.followup.send(f"You already have an active study room.")
             return
-
+        new_role = None
+        new_channel = None
         start_time = datetime.now()
         try:
             role_name = f"Study-{interaction.user.name}-Access"
-            new_role = await interaction.guild.create_role(name=role_name, reason="Temporary study room access role.")
+            new_role = await interaction.guild.create_role(name=role_name, mentionable=False)
             await interaction.user.add_roles(new_role)
             await partner.add_roles(new_role)
-
             overwrites = {
                 interaction.guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=False),
                 new_role: discord.PermissionOverwrite(connect=True, view_channel=True),
                 interaction.guild.me: discord.PermissionOverwrite(connect=True, view_channel=True)
             }
-
-            sanitized_topic = topic.lower().replace(' ', '-')
-            channel_name = f"🗣️study-{sanitized_topic[:15]}"
-            new_voice_channel = await interaction.guild.create_voice_channel(name=channel_name, overwrites=overwrites)
-
-            cleanup_task = self.loop.create_task(self.cleanup_room_timer(new_voice_channel.id, duration_minutes, topic))
-
-            self.active_rooms[new_voice_channel.id] = {
-                'owner_id': interaction.user.id,
-                'partner_id': partner.id,
-                'role_id': new_role.id,
-                'timer_task': cleanup_task,
-                'start_time': start_time,
-                'topic': topic
-            }
-            self.owner_to_channel[interaction.user.id] = new_voice_channel.id
-
+            channel_name = f"🗣️study-{topic.lower().replace(' ','-')[:15]}"
+            new_channel = await interaction.guild.create_voice_channel(name=channel_name, overwrites=overwrites)
+            cleanup_task = self.loop.create_task(self.cleanup_room_timer(new_channel.id, duration_minutes, topic))
+            self.active_rooms[new_channel.id] = {'owner_id': interaction.user.id,
+                                                 'partner_id': partner.id,
+                                                 'role_id': new_role.id,
+                                                 'timer_task': cleanup_task,
+                                                 'start_time': start_time,
+                                                 'topic': topic}
+            self.owner_to_channel[interaction.user.id] = new_channel.id
             end_time = start_time + timedelta(minutes=duration_minutes)
-            await interaction.followup.send(
-                f"**Study Room Created!**\nRoom: <#{new_voice_channel.id}>\nTopic: `{topic}`\nDuration: `{duration_minutes} minutes`\n"
-                f"Partner: {partner.mention} (Role: `{new_role.name}`)\nAccess Ends: <t:{int(end_time.timestamp())}:f>"
-            )
-
+            await interaction.followup.send(f"Room booked: <#{new_channel.id}> for {duration_minutes} minutes with {partner.mention}.")
         except Exception as e:
-            if 'new_role' in locals():
-                try: await new_role.delete(reason="Rollback")
+            if new_role:
+                try: await new_role.delete()
                 except: pass
-            if 'new_voice_channel' in locals():
-                try: await new_voice_channel.delete(reason="Rollback")
+            if new_channel:
+                try: await new_channel.delete()
                 except: pass
-            await interaction.followup.send(f"Error creating room: `{e}`")
+            await interaction.followup.send(f"Error creating room: {e}")
 
     @app_commands.command(name="studystats", description="See your total study hours recorded by the bot.")
     async def studystats(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
         user_id = interaction.user.id
-        self.db_cursor.execute('SELECT SUM(duration_seconds) FROM sessions WHERE user_id=? OR partner_id=?', (user_id, user_id))
+        self.db_cursor.execute('SELECT SUM(duration_seconds) FROM sessions WHERE user_id=? OR partner_id=?', (user_id,user_id))
         total_seconds = self.db_cursor.fetchone()[0]
         if not total_seconds:
-            await interaction.followup.send("You haven't logged any study sessions yet! Use `/bookroom` to start one.")
+            await interaction.followup.send("No study sessions logged yet.")
             return
-        hours, minutes = divmod(total_seconds // 60, 60)
-        await interaction.followup.send(f"**{interaction.user.name}'s Total Study Time:** {hours}h {minutes}m")
+        total_hours = total_seconds / 3600
+        total_minutes = (total_seconds % 3600) // 60
+        await interaction.followup.send(f"Total study time: {total_hours:.1f}h {total_minutes}m.")
 
     @app_commands.command(name="weeklyreport", description="Generates a graph of study hours for the past week.")
     async def weeklyreport(self, interaction: discord.Interaction):
@@ -200,38 +178,24 @@ class StudyBot(commands.Bot):
         self.db_cursor.execute('SELECT user_id, start_time, duration_seconds FROM sessions WHERE start_time >= ?', (one_week_ago.isoformat(),))
         rows = self.db_cursor.fetchall()
         if not rows:
-            await interaction.followup.send("No study sessions in the last 7 days.")
+            await interaction.followup.send("No sessions logged in the last 7 days.")
             return
-
         data = []
-        for uid, start_str, dur in rows:
-            day = datetime.fromisoformat(start_str).strftime('%A')
-            data.append({'user_id': uid, 'day': day, 'duration_hours': dur / 3600})
+        for user_id, start_time_str, duration_seconds in rows:
+            start_time = datetime.fromisoformat(start_time_str)
+            data.append({'user_id': user_id, 'day': start_time.strftime('%A'), 'duration_hours': duration_seconds/3600})
         df = pd.DataFrame(data)
-        weekly_summary = df.groupby(['day', 'user_id'])['duration_hours'].sum().reset_index()
-
-        user_names = {uid: interaction.guild.get_member(uid).display_name if interaction.guild.get_member(uid) else f"User {uid}" for uid in weekly_summary['user_id'].unique()}
+        weekly_summary = df.groupby(['day','user_id'])['duration_hours'].sum().reset_index()
+        user_names = {uid:(interaction.guild.get_member(uid).display_name if interaction.guild.get_member(uid) else f"User {uid}") for uid in weekly_summary['user_id'].unique()}
         weekly_summary['name'] = weekly_summary['user_id'].map(user_names)
         days_order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
-
-        plt.style.use('default')
         fig, ax = plt.subplots(figsize=(10,6))
-        plot_data = weekly_summary.pivot(index='day', columns='name', values='duration_hours').fillna(0)
-        plot_data = plot_data.reindex(days_order, fill_value=0)
+        plot_data = weekly_summary.pivot(index='day',columns='name',values='duration_hours').fillna(0).reindex(days_order, fill_value=0)
         plot_data.plot(kind='bar', ax=ax, rot=45, colormap='viridis')
-        ax.set_title('Study Time Logged in the Last 7 Days', fontsize=16, fontweight='bold')
-        ax.set_xlabel('Day of the Week')
-        ax.set_ylabel('Total Study Hours')
-        ax.legend(title='Student', bbox_to_anchor=(1.05,1), loc='upper left')
-        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        ax.set_title('Study Time Last 7 Days'); ax.set_xlabel('Day'); ax.set_ylabel('Hours')
         plt.tight_layout()
+        buffer = io.BytesIO(); plt.savefig(buffer, format='png'); buffer.seek(0); plt.close(fig)
+        await interaction.followup.send(file=discord.File(buffer, filename="weekly_report.png"))
 
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        plt.close(fig)
-        await interaction.followup.send(file=discord.File(buf, filename="weekly_study_report.png"))
-
-# --- Run Bot ---
 bot = StudyBot()
 bot.run(BOT_TOKEN)
