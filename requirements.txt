@@ -1,7 +1,6 @@
-discord.py==2.3.2
-python-dotenv==1.0.1
 discord.py==2.4.0
 pandas==2.2.3
 matplotlib==3.9.2
 aiohttp==3.9.5
 requests==2.32.3
+python-dotenv==1.0.1
